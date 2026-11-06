@@ -5,7 +5,9 @@ import signal
 import sys
 
 from broker.broker import Broker
-from config import load_broker_config
+from config import load_broker_config, load_publisher_config, load_subscriber_config
+from publisher.publisher import Publisher
+from subscriber.subscriber import Subscriber
 from protocol import valid_name
 
 
@@ -17,13 +19,17 @@ def main():
     args = parser.parse_args()
     if not valid_name(args.id):
         parser.error("--id must be nonempty and contain no whitespace/control characters")
-    if args.role != "broker":
-        parser.error(f"{args.role} is not implemented yet")
     try:
-        broker = Broker(args.id, load_broker_config(args.config))
+        implementations = {
+            "broker": (Broker, load_broker_config),
+            "publisher": (Publisher, load_publisher_config),
+            "subscriber": (Subscriber, load_subscriber_config),
+        }
+        implementation, load_config = implementations[args.role]
+        process = implementation(args.id, load_config(args.config))
         for sig in (signal.SIGTERM, signal.SIGINT):
-            signal.signal(sig, lambda signum, frame: broker.stop())
-        broker.run()
+            signal.signal(sig, lambda signum, frame: process.stop())
+        process.run()
     except (OSError, ValueError) as exc:
         print(f"{args.role}: {exc}", file=sys.stderr)
         return 1
