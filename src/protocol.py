@@ -41,7 +41,9 @@ def uint(value, size):
 
 
 def valid_name(value):
-    return bool(value) and not any(c.isspace() or ord(c) < 32 for c in value)
+    return (bool(value) and len(value.encode("utf-8")) <= MAX_BODY - 12
+            and not any(c.isspace() or ord(c) < 32 or 127 <= ord(c) <= 159
+                        for c in value))
 
 
 def string(value):
@@ -56,7 +58,7 @@ class Reader:
 
     def take(self, size):
         end = self.offset + size
-        if end > len(self.data):
+        if size < 0 or end > len(self.data):
             raise ProtocolError("truncated body")
         value = self.data[self.offset:end]
         self.offset = end
@@ -84,6 +86,10 @@ class Frame:
 
 
 def encode_frame(kind, transmission_id, body=b""):
+    try:
+        kind = Kind(kind)
+    except ValueError as exc:
+        raise ProtocolError("unknown message type") from exc
     if len(body) > MAX_BODY:
         raise ProtocolError("body too large")
     return (MAGIC + uint(VERSION, 1) + uint(kind, 1)
@@ -150,6 +156,8 @@ def parse_welcome(body):
     reader = Reader(body)
     result = reader.number(8), reader.number(2), reader.text()
     reader.finish()
+    if not result[0] or not result[1] or not valid_name(result[2]):
+        raise ProtocolError("invalid WELCOME")
     return result
 
 
@@ -157,6 +165,9 @@ def validate_topic(topic, is_filter=False):
     parts = topic.split("/")
     if not valid_name(topic) or any(not part for part in parts):
         raise ProtocolError("invalid topic")
+    # Leave room for publication fields and the largest generated reading value.
+    if len(topic.encode("utf-8")) > MAX_BODY - 23 - len(f"reading={MAX_ID}"):
+        raise ProtocolError("topic too long for an EventCast publication")
     if is_filter and parts[-1] == "*":
         if len(parts) not in (2, 3) or any("*" in p for p in parts[:-1]):
             raise ProtocolError("invalid subscription filter")

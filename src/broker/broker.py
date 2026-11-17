@@ -117,6 +117,9 @@ class Broker:
         self.selector.unregister(client.sock)
         del self.clients[client.sock]
         self.sessions.pop(client.session_id, None)
+        client.ready = False
+        client.closing = True
+        client.waiting_since = None
         client.pending.clear()
         client.seen.clear()
         client.subscriptions.clear()

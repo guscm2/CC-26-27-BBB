@@ -2,7 +2,7 @@
 
 Os dois clientes usam diretamente sockets TCP e UDP e apenas a biblioteca padrão
 de Python (3.10 ou superior, tal como os tipos usados no broker existente).
-`main.py` escolhe agora qualquer um dos três papéis.
+`main.py` escolhe qualquer um dos três papéis.
 
 ## Experimentar
 
@@ -24,8 +24,8 @@ Também é possível invocar `/caminho/CC-26-27-BBB/run.sh` de qualquer diretori
 Os caminhos de configuração e de log devem ser absolutos. O diretório dos logs
 deve existir antes do arranque.
 
-Para o CORE, mudar `bind` do broker para `10.0.3.20` e `broker_control` dos clientes
-para `10.0.3.20:7310`, e executar cada papel no respetivo nó da topologia.
+Para o CORE, usar as configurações em `configs/core/` e seguir o
+[procedimento da topologia e demonstração](core.md).
 As portas usadas são sempre as da configuração; a porta UDP do broker é descoberta
 pela resposta WELCOME. Cada cliente anuncia no HELLO a sua porta UDP efémera.
 
@@ -120,3 +120,11 @@ fan-out, seletividade, filtros sobrepostos e logs. Se o ambiente proibir sockets
 esse teste é marcado como ignorado com a razão explícita. Isso não substitui a
 execução no CORE, as capturas de tráfego nem os testes SIGSTOP/SIGCONT no ambiente
 de demonstração. As ligações entre vários brokers continuam por implementar.
+
+`test_integration.py` acrescenta perdas determinísticas com sockets reais,
+estabelecimento de sessão fragmentado, drain sem ACKs, expulsão com observação do
+fecho TCP, SIGSTOP/SIGCONT curto/longo, SIGTERM e execução de um ZIP extraído com
+os três intérpretes sem site-packages (`-S`). `test_review.py` verifica limites
+binários, validação de configurações, IDs e transições dos temporizadores.
+`test_artifacts.py` verifica as configurações CORE e o formato do arquivo.
+O launcher de perdas `tests/loss_runner.py` só é usado nos testes; não altera run.sh.

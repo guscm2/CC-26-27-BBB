@@ -33,6 +33,7 @@ def seconds(value, key):
 
 
 def load_broker_config(path):
+    _absolute_config(path)
     required = {"bind", "control_port", "data_port", "duration", "evict_after"}
     values, peers = {}, []
     with open(path, encoding="utf-8") as source:
@@ -106,6 +107,7 @@ class SubscriberConfig:
 
 
 def _client_values(path, required, repeated):
+    _absolute_config(path)
     values = {}
     lists = {key: [] for key in repeated}
     with open(path, encoding="utf-8") as source:
@@ -121,6 +123,8 @@ def _client_values(path, required, repeated):
             if key in lists:
                 lists[key].append(value)
             elif key in required and key not in values:
+                if len(value.split()) != 1:
+                    raise ValueError(f"line {number}: expected one value for {key}")
                 values[key] = value
             else:
                 raise ValueError(f"line {number}: unknown or repeated key {key}")
@@ -132,6 +136,11 @@ def _client_values(path, required, repeated):
     if not Path(values["log"]).is_absolute():
         raise ValueError("log must be an absolute path")
     return values, lists
+
+
+def _absolute_config(path):
+    if not Path(path).is_absolute():
+        raise ValueError("config must be an absolute path")
 
 
 def _options(value):

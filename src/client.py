@@ -7,7 +7,7 @@ import time
 
 from protocol import (
     Kind, MAX_DATAGRAM, MAX_ID, ProtocolError, Reader, decode_datagram,
-    encode_frame, hello_body, parse_welcome, pop_frame, valid_name,
+    encode_frame, hello_body, parse_welcome, pop_frame,
 )
 
 CONNECT_TIMEOUT = 10.0
@@ -154,8 +154,6 @@ class NetworkClient:
             if frame.kind != Kind.WELCOME:
                 raise ProtocolError("expected WELCOME")
             session_id, data_port, broker_id = parse_welcome(frame.body)
-            if not session_id or not data_port or not valid_name(broker_id):
-                raise ProtocolError("invalid WELCOME")
             self.session_id = session_id
             self.data_address = (self.config.broker_control[0], data_port)
             self.ready = True
@@ -194,10 +192,10 @@ class NetworkClient:
         self.stop()
 
     def close(self):
-        if self.tcp is not None and self.ready:
+        if self.tcp is not None and self.ready and self.next_control_id <= MAX_ID:
             try:
                 # Preserve framing if a control message was only partially sent.
-                goodbye = encode_frame(Kind.BYE, min(self.next_control_id, MAX_ID))
+                goodbye = encode_frame(Kind.BYE, self.next_control_id)
                 self.tcp.send(self.outgoing + goodbye)
             except OSError:
                 pass
