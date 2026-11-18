@@ -27,6 +27,7 @@ determinísticas e SIGSTOP/SIGCONT em processos reais. São ensaios localhost, n
 - [Topologia e demonstração no CORE](docs/core.md)
 - [Campos binários, trocas e temporizadores](docs/protocol.md)
 - [Funcionamento dos clientes](docs/clients.md)
+- [Percurso do código e processamento do protocolo](docs/code-walkthrough.md)
 
 Para preparar a entrega, fornecer os valores reais do turno e grupo:
 
