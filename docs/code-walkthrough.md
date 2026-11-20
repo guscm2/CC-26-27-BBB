@@ -12,18 +12,33 @@ O sistema é um *publish/subscribe* de broker único. Cada papel é um processo
 Python independente e usa sockets não bloqueantes com `selectors`; não há threads.
 
 ```text
-                 SubControl (TCP)
-publisher  -------------------------->  broker
-subscriber -------------------------->  broker
+                   SubControl (TCP, bidirecional e ordenado)
+publisher   <-------------------------------> broker
+subscriber  <-------------------------------> broker
 
-                 EventCast (UDP)
-publisher  ---- PUBLISH / ACK --------> broker
-subscriber <--- DELIVER / ACK --------> broker
+                   EventCast (UDP, datagramas independentes)
+publisher   -------- PUBLISH(tx=P) --------> broker
+publisher   <---------- ACK(tx=P) ---------- broker
+subscriber  <------- DELIVER(tx=S) --------- broker
+subscriber  ---------- ACK(tx=S) ---------> broker
 ```
 
 O TCP existe para estabelecer e controlar a sessão: `HELLO`, `WELCOME`,
 `SUBSCRIBE`, `UNSUBSCRIBE`, `OK`, `ERROR` e `BYE`. O UDP transporta os eventos:
 `PUBLISH`, `DELIVER` e `ACK`.
+
+Esta separação é uma decisão de transporte. TCP fornece um fluxo de bytes
+fiável, ordenado e com controlo de congestão, adequado às alterações de sessão
+que não podem perder-se ou aplicar-se fora de ordem. Não preserva, porém,
+fronteiras de mensagens: o protocolo acrescenta *framing*. UDP preserva cada
+datagrama, mas pode perder, duplicar e reordenar datagramas; por isso EventCast
+implementa ACK, retransmissão e, em G2, deduplicação. Não usar TCP para os dados
+evita que uma perda para um subscriber retenha eventos posteriores destinados a
+outros recetores (*head-of-line blocking*).
+
+Cada salto tem o seu próprio espaço de IDs: `ACK(tx=7)` significa apenas que o
+datagrama de ID 7 daquela sessão e salto foi aceite. Um `txid` de `PUBLISH` não é
+o `txid` de um `DELIVER`, mesmo quando ambos representam o mesmo evento lógico.
 
 O ponto de entrada escolhe a classe e o leitor de configuração corretos:
 
@@ -73,6 +88,12 @@ O `transmission_id` identifica uma transmissão **num salto**. Não é o mesmo q
 o `message_id`: o primeiro associa ACKs a um datagrama; o segundo identifica a
 publicação lógica e mantém-se desde o publisher até ao subscriber.
 
+O tamanho no cabeçalho permite encontrar o fim de uma frame sem delimitadores
+(que poderiam ocorrer no `payload`). Antes de interpretar um corpo, `read_header`
+valida *magic*, versão, tipo conhecido e limite de tamanho. No corpo, cada
+descodificador chama `Reader.finish()`: bytes residuais também são erro, evitando
+aceitar extensões ou campos silenciosamente ignorados.
+
 ### TCP não preserva limites de mensagens
 
 Uma chamada `recv()` pode conter parte de uma mensagem ou várias. `pop_frame`
@@ -95,6 +116,12 @@ Logo, fragmentação TCP não é tratada como erro: o processo espera pelos byte
 falta. Depois de uma frame completa, o ciclo chama `pop_frame` novamente, tratando
 coalescência de várias mensagens na mesma leitura.
 
+Também não se pressupõe que `send()` envie uma frame inteira. Em sockets não
+bloqueantes pode aceitar só um prefixo; o sufixo fica em `outgoing` até existir
+novo `EVENT_WRITE`. Assim não se corta uma frame de controlo a meio. O limite de
+1 MiB nas filas de controlo limita a memória acumulada por um par lento; no
+broker, excesso de saída fecha apenas a sessão que o causou.
+
 ### UDP preserva o datagrama
 
 Em UDP cada datagrama deve ser exatamente uma mensagem completa. Comprimento a
@@ -110,6 +137,11 @@ def decode_datagram(data):
 
 O limite é `65507` bytes, o máximo de payload UDP IPv4. Na prática os payloads
 devem ser pequenos para evitar fragmentação IP.
+
+`recvfrom(MAX_DATAGRAM + 1)` deixa espaço para detetar e rejeitar datagramas acima
+do máximo, em vez de aceitar acidentalmente um prefixo truncado. Um datagrama
+malformado é descartado isoladamente; depois da validação binária ainda pode ser
+descartado por corpo, sessão, papel ou origem inválidos.
 
 ## 3. Estabelecimento da sessão
 
@@ -164,6 +196,12 @@ self._reply(client, Kind.WELCOME, frame.transmission_id,
             welcome_body(session_id, self.config.data_port, self.broker_id))
 ```
 
+No TCP os IDs fazem correlação, não retransmissão: o próprio TCP volta a entregar
+bytes enquanto a ligação existir. O cliente guarda cada pedido em `requests` com
+tipo esperado e prazo. Uma resposta com ID não pendente é erro; `HELLO` só aceita
+`WELCOME` e os restantes pedidos só aceitam `OK` vazio (ou `ERROR`). Isto impede
+que uma resposta atrasada seja associada à operação errada.
+
 O cliente só fica `ready` após receber e validar o `WELCOME`; assim aprende o
 porto UDP do broker:
 
@@ -183,6 +221,12 @@ if not client.outgoing:
     # WELCOME has actually been written before UDP is accepted.
     client.ready = client.role is not None
 ```
+
+“Escrito” aqui significa aceite pelo buffer de envio do sistema operativo, não
+que o cliente já leu o `WELCOME`; essa confirmação exigiria outra mensagem de
+aplicação. Ainda assim elimina a corrida local de aceitar EventCast antes de
+tentar entregar as credenciais da sessão. O cliente só começa EventCast após
+descodificar um `WELCOME` válido, que é a barreira complementar.
 
 Sequência mínima:
 
@@ -241,6 +285,13 @@ self._datagram(decode_datagram(raw))
 Isto evita aceitar tráfego casual ou ACKs de outra sessão, mas não é autenticação
 criptográfica e não resolve cenários NAT.
 
+O `session_id` é um token aleatório, mas viaja em claro: não há TLS, MAC ou
+assinatura. Alguém que observe tráfego e consiga falsificar IP/porta pode injetar
+datagramas. A associação ao IP/porta reduz erros e impede anunciar no `HELLO` o
+endpoint de outra máquina, mas não autentica o emissor. A implementação é IPv4 e
+assume que o endereço observado no TCP identifica também a origem UDP; NATs
+assimétricos podem violar esse pressuposto.
+
 ## 5. Subscrições e seleção por tópico
 
 Depois da sessão, o subscriber envia as subscrições configuradas. Cada pedido
@@ -261,6 +312,14 @@ topic_filter, qos = parse_subscription(frame.body)
 client.subscriptions[topic_filter] = qos
 self._reply(client, Kind.OK, frame.transmission_id)
 ```
+
+`SUBSCRIBE` e `UNSUBSCRIBE` são ordenados no fluxo TCP daquele cliente: quando o
+broker processa uma frame, todas as frames TCP anteriores dessa ligação já foram
+processadas. Repetir `SUBSCRIBE` para o mesmo filtro substitui o QoS anterior; um
+`UNSUBSCRIBE` de filtro ausente é idempotente. O `OK` confirma que a alteração já
+foi aplicada no broker, não apenas enfileirada localmente. O subscriber atualiza
+também a cópia local ao enviar o pedido, para decidir imediatamente se deve
+registar uma entrega em voo.
 
 Os tópicos de publicação têm três níveis, por exemplo
 `north/station7/temperature`. Um filtro pode ser exato ou acabar em `/*`, com um
@@ -284,6 +343,12 @@ for txid, pending in list(client.pending.items()):
 
 Se um `DELIVER` já estiver no socket quando o cancelamento acontece, o subscriber
 não o escreve no log, mas confirma-o para impedir retransmissões desnecessárias.
+
+Não existe uma barreira distribuída entre o TCP de controlo e UDP. Portanto, o
+`OK` de `UNSUBSCRIBE` garante que o broker já não cria/retem entregas sem filtros
+restantes, mas não que não haja datagramas antigos na rede. Confirmá-los liberta
+o estado pendente que o broker possa ainda ter, sem voltar a produzir uma linha de
+log após o cancelamento local.
 
 ## 6. Publicação e fan-out
 
@@ -344,6 +409,14 @@ self._send_udp(packet, subscriber.endpoint)
 Assim, numa mesma publicação para dois subscribers, tópico, payload e
 `message_id` são iguais, mas `session_id` e `transmission_id` de cada `DELIVER`
 são diferentes.
+
+O fan-out não espera pelo I/O dos recetores: `sendto` é não bloqueante e cada
+destino recebe uma entrada `Pending` independente. Um subscriber lento não adia
+o ACK para o publisher nem a recuperação de outro subscriber. A ordem de criação
+dos `DELIVER` segue normalmente a ordem de processamento de `PUBLISH`, mas UDP
+não garante a ordem de chegada e não existe número de sequência nem buffer de
+reordenação. A garantia é de aceitação/duplicação conforme QoS, não de entrega
+ordenada.
 
 ## 7. ACK, retransmissão e QoS
 
@@ -408,6 +481,11 @@ self._send_udp(encode_frame(Kind.ACK, frame.transmission_id,
 O `flush` no `_write_log` ocorre antes do ACK. Portanto, receber um ACK de
 subscriber significa que a linha de log correspondente já foi aceite pelo processo.
 
+Com rigor, `flush()` transfere o buffer Python para o sistema operativo; não há
+`fsync()`. O ACK indica aceitação pelo processo e visibilidade imediata no ficheiro
+aberto, mas não durabilidade perante falha de energia/SO. Esta escolha evita que
+I/O de disco síncrono atrase cada ACK.
+
 ### Retransmissão seletiva
 
 O publisher reenvia cada `PUBLISH` ainda pendente a cada 250 ms, sem bloquear
@@ -431,6 +509,13 @@ for pending in client.pending.values():
 
 Como cada transmissão tem uma entrada própria, confirmar uma entrega não confirma
 as outras. Várias publicações podem estar em trânsito ao mesmo tempo.
+
+Cada reenvio reutiliza exatamente o pacote guardado: mesmo `session_id`,
+`message_id`, `transmission_id`, tópico e payload. Um novo `txid` impediria que o
+ACK de uma cópia anterior removesse o pendente; um novo `message_id` criaria outra
+publicação lógica. O temporizador é por entrada, não bloqueia a geração seguinte,
+logo há *pipelining*. Não existem *exponential backoff*, estimativa de RTT ou
+janela de congestão; 250 ms é uma política fixa, não um mecanismo TCP equivalente.
 
 ## 8. Evicção, fecho e temporizadores
 
@@ -465,6 +550,13 @@ client.seen.clear()
 client.subscriptions.clear()
 ```
 
+Ao remover o mapeamento antes de fechar, PUBLISH ou ACK UDP atrasados deixam de
+encontrar sessão válida e são descartados. Uma nova ligação do mesmo `client_id`
+obtém outro `session_id` e não herda filtros, pendentes nem a tabela G2. `BYE` é
+gracioso: desativa UDP, limpa estado e tenta responder `OK`; EOF/erro faz a mesma
+limpeza sem confirmação. O cliente envia `BYE` no fecho apenas por melhor esforço
+e não espera pelo `OK`, para que o encerramento não fique bloqueado.
+
 `BYE` marca o cliente como em fecho, deixa de aceitar UDP e responde `OK`; EOF TCP
 tem o mesmo efeito prático de limpar a sessão. O subscriber não tenta reconectar
 após expulsão, para não voltar a consumir datagramas de uma sessão inválida.
@@ -497,6 +589,11 @@ Broker, por cliente
   BYE/EOF/evicção -> remover sessão e limpar estado
 ```
 
+`ready` não significa apenas “TCP ligado”. No cliente exige UDP local, `WELCOME`
+validado e endpoint UDP do broker conhecido; no broker exige que `WELCOME` tenha
+saído da fila TCP. Fecho ou desconexão revoga-o antes de datagramas futuros serem
+aceites. Esta separação entre ligação e sessão impede dados durante o *handshake*.
+
 ## 10. Limites importantes da implementação
 
 - A fiabilidade depende de a rede recuperar antes de `drain`, `duration` ou
@@ -506,6 +603,11 @@ Broker, por cliente
 - Não há janela máxima de pendentes nem controlo de congestionamento. Uma carga
   elevada ou um subscriber parado pode aumentar a memória e atrasar temporizadores.
 - O RTO é fixo em 250 ms: é simples e previsível, mas não se adapta a RTT ou carga.
+- UDP pode reordenar datagramas; não há garantia de ordem entre `DELIVER`, nem de
+  relação temporal entre o ACK ao publisher e a chegada de uma entrega.
+- Um ACK não é cumulativo: confirma uma só entrada pelo seu `transmission_id`.
+  ACKs duplicados, desconhecidos ou de origem/sessão inválida não confirmam outra
+  transmissão nem renovam o prazo de evicção.
 - A validação de origem IP/porto e `session_id` reduz tráfego inválido, mas não
   substitui autenticação, integridade criptográfica ou suporte NAT.
 - Ligações `peer` e encaminhamento entre brokers não estão implementados.
